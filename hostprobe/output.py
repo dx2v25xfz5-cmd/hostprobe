@@ -7,6 +7,7 @@ import dataclasses
 import io
 import json
 import sys
+import time
 from datetime import datetime
 from enum import Enum
 from typing import Any
@@ -103,21 +104,39 @@ class TerminalProgress:
 
 
 class BatchProgress:
-    """Progress reporter for batch mode."""
+    """Progress reporter for batch mode with ETA."""
 
     def __init__(self, total: int, use_color: bool = True, quiet: bool = False):
         self.total = total
         self.current = 0
         self.use_color = use_color
         self.quiet = quiet
+        self._start = time.monotonic()
 
     def start_domain(self, domain: str) -> TerminalProgress:
         self.current += 1
         if not self.quiet:
             counter = _c(C.BOLD, f"[{self.current}/{self.total}]", self.use_color)
-            sys.stderr.write(f"\n{counter} Scanning {domain}\n")
+            elapsed = time.monotonic() - self._start
+            eta = ""
+            if self.current > 1:
+                avg = elapsed / (self.current - 1)
+                remaining = avg * (self.total - self.current + 1)
+                eta = f"  ETA {remaining:.0f}s"
+            sys.stderr.write(f"\n{counter} Scanning {domain}{eta}\n")
             sys.stderr.flush()
         return TerminalProgress(domain, self.use_color, self.quiet)
+
+    def summary(self) -> None:
+        """Print final summary line after all domains are processed."""
+        if self.quiet:
+            return
+        elapsed = time.monotonic() - self._start
+        sys.stderr.write(
+            f"\n{_c(C.GREEN, '✓', self.use_color)} "
+            f"Completed {self.total} domain(s) in {elapsed:.1f}s\n"
+        )
+        sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +337,30 @@ def format_terminal(report: DomainReport, use_color: bool | None = None) -> str:
         for artifact in edge.cloud_artifacts:
             lines.append(f"    {artifact}")
 
+    # WAF
+    if report.waf and report.waf.detected:
+        lines.append("")
+        lines.append(_section("WAF / FIREWALL", use_color))
+        lines.append(f"  Provider       : {_c(C.YELLOW, report.waf.provider or '?', use_color)}")
+        if report.waf.is_blocking:
+            lines.append(f"  Status         : {_c(C.RED, 'BLOCKING', use_color)}")
+        for ev in report.waf.evidence[:5]:
+            lines.append(f"    {ev}")
+
+    # ASN / Geolocation
+    if report.asn and report.asn.asn:
+        lines.append("")
+        lines.append(_section("ASN / GEO", use_color))
+        lines.append(f"  IP             : {report.asn.ip}")
+        lines.append(f"  ASN            : AS{report.asn.asn} ({report.asn.asn_org or '?'})")
+        if report.asn.isp:
+            lines.append(f"  ISP            : {report.asn.isp}")
+        loc_parts = [p for p in [report.asn.city, report.asn.country] if p]
+        if loc_parts:
+            lines.append(f"  Location       : {', '.join(loc_parts)}")
+        if report.asn.is_cloud:
+            lines.append(f"  Cloud          : {_c(C.CYAN, report.asn.cloud_provider or '?', use_color)}")
+
     # Decommission
     if report.decommission and report.decommission.likely_decommissioned:
         lines.append("")
@@ -484,6 +527,18 @@ _CSV_COLUMNS = [
     "dangling_cnames",
     "decommission_likely",
     "decommission_evidence",
+    "waf_detected",
+    "waf_provider",
+    "waf_blocking",
+    "waf_evidence",
+    "asn_ip",
+    "asn_number",
+    "asn_org",
+    "asn_isp",
+    "asn_country",
+    "asn_city",
+    "asn_is_cloud",
+    "asn_cloud_provider",
     "scan_started",
     "scan_finished",
     "scan_duration_s",
@@ -591,6 +646,20 @@ def _report_to_csv_row(report: DomainReport) -> dict[str, str]:
         # Decommission
         "decommission_likely": str(report.decommission.likely_decommissioned),
         "decommission_evidence": _join(report.decommission.evidence),
+        # WAF
+        "waf_detected": str(report.waf.detected) if report.waf else "",
+        "waf_provider": report.waf.provider or "" if report.waf else "",
+        "waf_blocking": str(report.waf.is_blocking) if report.waf else "",
+        "waf_evidence": _join(report.waf.evidence) if report.waf else "",
+        # ASN
+        "asn_ip": report.asn.ip if report.asn else "",
+        "asn_number": str(report.asn.asn) if report.asn and report.asn.asn else "",
+        "asn_org": report.asn.asn_org or "" if report.asn else "",
+        "asn_isp": report.asn.isp or "" if report.asn else "",
+        "asn_country": report.asn.country or "" if report.asn else "",
+        "asn_city": report.asn.city or "" if report.asn else "",
+        "asn_is_cloud": str(report.asn.is_cloud) if report.asn else "",
+        "asn_cloud_provider": report.asn.cloud_provider or "" if report.asn else "",
         # Metadata
         "scan_started": _dt(report.scan_started),
         "scan_finished": _dt(report.scan_finished),
@@ -610,3 +679,264 @@ def format_csv(reports: DomainReport | list[DomainReport]) -> str:
     for report in reports:
         writer.writerow(_report_to_csv_row(report))
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# HTML report
+# ---------------------------------------------------------------------------
+
+_VERDICT_COLORS = {
+    "active": "#22c55e",
+    "inactive": "#ef4444",
+    "parked": "#f59e0b",
+    "forwarding": "#3b82f6",
+    "mail-only": "#8b5cf6",
+    "suspended": "#dc2626",
+    "for-sale": "#f97316",
+    "error": "#6b7280",
+    "unknown": "#6b7280",
+}
+
+
+def _html_escape(text: str) -> str:
+    """Minimal HTML escaping."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _html_section(title: str, rows: list[tuple[str, str]]) -> str:
+    """Build an HTML section with a title and key-value rows."""
+    if not rows:
+        return ""
+    html = f'<div class="section"><h3>{_html_escape(title)}</h3><table>\n'
+    for label, value in rows:
+        html += f"<tr><td class='label'>{_html_escape(label)}</td>"
+        html += f"<td>{_html_escape(str(value))}</td></tr>\n"
+    html += "</table></div>\n"
+    return html
+
+
+def _html_list_section(title: str, items: list[str]) -> str:
+    """Build an HTML section with a bulleted list."""
+    if not items:
+        return ""
+    html = f'<div class="section"><h3>{_html_escape(title)}</h3><ul>\n'
+    for item in items:
+        html += f"<li>{_html_escape(item)}</li>\n"
+    html += "</ul></div>\n"
+    return html
+
+
+def format_html(reports: DomainReport | list[DomainReport]) -> str:
+    """Generate a self-contained HTML report with inline CSS."""
+    if isinstance(reports, DomainReport):
+        reports = [reports]
+
+    css = """
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+           'Helvetica Neue', Arial, sans-serif; background: #0f172a; color: #e2e8f0;
+           padding: 2rem; line-height: 1.6; }
+    h1 { font-size: 1.8rem; margin-bottom: 1.5rem; color: #38bdf8; }
+    .report { background: #1e293b; border-radius: 12px; padding: 1.5rem;
+              margin-bottom: 2rem; border: 1px solid #334155; }
+    .report-header { display: flex; justify-content: space-between;
+                     align-items: center; margin-bottom: 1rem;
+                     border-bottom: 1px solid #334155; padding-bottom: 1rem; }
+    .domain { font-size: 1.4rem; font-weight: 700; color: #f1f5f9; }
+    .verdict { font-size: 1.1rem; font-weight: 600; padding: 0.3rem 0.9rem;
+               border-radius: 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+    .section { margin-top: 1rem; }
+    .section h3 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.1em;
+                  color: #94a3b8; margin-bottom: 0.5rem;
+                  border-bottom: 1px solid #334155; padding-bottom: 0.3rem; }
+    table { width: 100%; border-collapse: collapse; }
+    td { padding: 0.25rem 0.5rem; vertical-align: top; font-size: 0.9rem; }
+    td.label { color: #94a3b8; width: 180px; white-space: nowrap; }
+    ul { list-style: disc; padding-left: 1.5rem; }
+    li { font-size: 0.9rem; margin-bottom: 0.2rem; }
+    .reasoning { background: #0f172a; border-radius: 6px; padding: 1rem;
+                 margin-top: 1rem; white-space: pre-wrap; font-size: 0.9rem;
+                 border: 1px solid #334155; }
+    .meta { font-size: 0.8rem; color: #64748b; margin-top: 1rem; }
+    """
+
+    parts: list[str] = []
+    parts.append("<!DOCTYPE html>\n<html lang='en'>\n<head>")
+    parts.append("<meta charset='UTF-8'>")
+    parts.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
+    parts.append(f"<title>hostprobe report</title>\n<style>{css}</style>\n</head>\n<body>")
+    parts.append(f"<h1>hostprobe report &mdash; {len(reports)} domain(s)</h1>")
+
+    for r in reports:
+        vc = _VERDICT_COLORS.get(r.verdict.value, "#6b7280")
+        parts.append('<div class="report">')
+        parts.append('<div class="report-header">')
+        parts.append(f'<span class="domain">{_html_escape(r.domain)}</span>')
+        parts.append(
+            f'<span class="verdict" style="background:{vc};color:#fff">'
+            f"{_html_escape(r.verdict.value)}</span>"
+        )
+        parts.append("</div>")
+
+        # DNS
+        dns = r.dns
+        dns_rows = [
+            ("Classification", dns.classification.value),
+            ("DNSSEC", dns.dnssec_status),
+        ]
+        if dns.cname_chain:
+            dns_rows.append(("CNAME Chain", " → ".join(dns.cname_chain)))
+        for rtype in ("A", "AAAA", "MX", "NS", "TXT", "SOA", "CAA", "SRV"):
+            vals = dns.records.get(rtype, [])
+            if vals:
+                dns_rows.append((rtype, ", ".join(vals)))
+        parts.append(_html_section("DNS", dns_rows))
+
+        # WHOIS
+        w = r.whois
+        whois_rows = [
+            ("Registered", str(w.registered)),
+            ("Registrar", w.registrar or "—"),
+        ]
+        if w.creation_date:
+            whois_rows.append(("Created", str(w.creation_date)))
+        if w.expiry_date:
+            whois_rows.append(("Expires", str(w.expiry_date)))
+        if w.nameservers:
+            whois_rows.append(("Name Servers", ", ".join(w.nameservers)))
+        if w.recently_expired:
+            whois_rows.append(("Recently Expired", "Yes"))
+        parts.append(_html_section("WHOIS", whois_rows))
+
+        # Subdomains
+        if r.subdomains:
+            sub_items = [
+                f"{s.fqdn} → {', '.join(s.addresses)}" if s.resolved else f"{s.fqdn} (unresolved)"
+                for s in r.subdomains[:30]
+            ]
+            parts.append(_html_list_section("Subdomains", sub_items))
+
+        # Passive
+        if r.passive:
+            passive_rows: list[tuple[str, str]] = []
+            if r.passive.ct_entries:
+                ct_names = [e.common_name for e in r.passive.ct_entries[:10]]
+                passive_rows.append(("CT Logs", ", ".join(ct_names)))
+            if r.passive.discovered_subdomains:
+                passive_rows.append(("Discovered Subs", ", ".join(sorted(r.passive.discovered_subdomains)[:10])))
+            if passive_rows:
+                parts.append(_html_section("Passive Recon", passive_rows))
+
+        # Ports
+        if r.port_probes:
+            port_items = []
+            for pp in r.port_probes:
+                port_items.append(f":{pp.port} — {pp.state.value} ({pp.method})")
+            parts.append(_html_list_section("Port Probes", port_items))
+
+        # TLS
+        if r.tls:
+            tls_rows = [
+                ("Handshake", "OK" if r.tls.handshake_ok else f"FAIL: {r.tls.error_reason or '?'}"),
+                ("Subject CN", r.tls.cert_cn or "—"),
+                ("Issuer", r.tls.issuer or "—"),
+                ("SANs", ", ".join(r.tls.cert_san_list) if r.tls.cert_san_list else "—"),
+                ("Protocol", r.tls.tls_version or "—"),
+                ("Expired", str(r.tls.is_expired)),
+                ("Matches Domain", str(r.tls.cert_matches_domain)),
+            ]
+            if r.tls.not_after:
+                tls_rows.append(("Not After", str(r.tls.not_after)))
+            parts.append(_html_section("TLS Certificate", tls_rows))
+
+        # HTTP
+        if r.http:
+            http_rows = [
+                ("Status", str(r.http.status_code or "—")),
+                ("Server", r.http.server_header or "—"),
+            ]
+            if r.http.redirect_target:
+                http_rows.append(("Redirect", r.http.redirect_target))
+            parts.append(_html_section("HTTP", http_rows))
+
+        # WAF
+        if r.waf and r.waf.detected:
+            waf_rows = [
+                ("Provider", r.waf.provider or "?"),
+                ("Blocking", "Yes" if r.waf.is_blocking else "No"),
+            ]
+            parts.append(_html_section("WAF / Firewall", waf_rows))
+            if r.waf.evidence:
+                parts.append(_html_list_section("WAF Evidence", r.waf.evidence[:5]))
+
+        # ASN
+        if r.asn and r.asn.asn:
+            asn_rows = [
+                ("IP", r.asn.ip),
+                ("ASN", f"AS{r.asn.asn}"),
+                ("Organization", r.asn.asn_org or "—"),
+            ]
+            if r.asn.isp:
+                asn_rows.append(("ISP", r.asn.isp))
+            loc = ", ".join(p for p in [r.asn.city, r.asn.country] if p)
+            if loc:
+                asn_rows.append(("Location", loc))
+            if r.asn.is_cloud:
+                asn_rows.append(("Cloud Provider", r.asn.cloud_provider or "?"))
+            parts.append(_html_section("ASN / Geolocation", asn_rows))
+
+        # SMTP
+        if r.smtp:
+            smtp_rows = [
+                ("Banner", r.smtp.banner or "—"),
+                ("STARTTLS", str(r.smtp.supports_starttls)),
+                ("Responsive", str(r.smtp.responsive)),
+            ]
+            parts.append(_html_section("SMTP", smtp_rows))
+
+        # Banners
+        if r.banners:
+            banner_items = [f":{b.port} — {b.banner_text[:120]}" for b in r.banners if b.banner_text]
+            if banner_items:
+                parts.append(_html_list_section("Banners", banner_items))
+
+        # Edge Cases
+        edge = r.edge_cases
+        edge_items: list[str] = []
+        if edge.is_wildcard:
+            edge_items.append("Wildcard DNS")
+        if edge.is_cdn:
+            edge_items.append(f"CDN: {edge.cdn_provider}")
+        if edge.cloud_provider:
+            edge_items.append(f"Cloud: {edge.cloud_provider}")
+        if edge.has_ipv6:
+            edge_items.append(f"IPv6: {'reachable' if edge.ipv6_reachable else 'AAAA only'}")
+        if edge.dangling_cnames:
+            edge_items.append(f"{len(edge.dangling_cnames)} dangling CNAME(s)")
+        if edge_items:
+            parts.append(_html_list_section("Edge Cases", edge_items))
+
+        # Decommission
+        if r.decommission.likely_decommissioned:
+            parts.append(
+                _html_list_section("Decommission Signals", r.decommission.evidence)
+            )
+
+        # Reasoning
+        if r.reasoning:
+            parts.append(
+                f'<div class="reasoning">{_html_escape(chr(10).join(r.reasoning))}</div>'
+            )
+
+        # Meta
+        dur = f"{r.scan_duration_s:.1f}s" if r.scan_duration_s else "?"
+        parts.append(f'<div class="meta">Scanned {r.scan_started or "?"} — {dur}</div>')
+        parts.append("</div>")  # close .report
+
+    parts.append("</body>\n</html>")
+    return "\n".join(parts)

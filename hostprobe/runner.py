@@ -6,6 +6,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
+from hostprobe.asn_lookup import lookup_asn
 from hostprobe.cloud_checks import detect_cloud_artifacts, detect_dangling_cnames
 from hostprobe.config import Config
 from hostprobe.decommission import check_decommission_signals
@@ -35,6 +36,8 @@ from hostprobe.models import (
 )
 from hostprobe.passive_recon import passive_recon
 from hostprobe.subdomain_checks import check_subdomains
+from hostprobe.utils import retry_with_backoff
+from hostprobe.waf_detection import detect_waf
 from hostprobe.whois_check import check_whois
 
 logger = logging.getLogger("hostprobe")
@@ -70,7 +73,7 @@ async def analyze_domain(
     # ==================================================================
     prog.phase("DNS", "Classifying DNS and checking records")
 
-    dns_task = classify_dns(domain, config.resolvers, timeout)
+    dns_task = classify_dns(domain, config.resolvers, timeout, use_doh=config.use_doh)
     records_task = check_all_records(domain, timeout)
     whois_task = check_whois(domain)
     cname_task = trace_cname_chain(domain, timeout)
@@ -183,6 +186,9 @@ async def analyze_domain(
             skip=config.skip_passive,
             securitytrails_key=config.securitytrails_api_key,
             virustotal_key=config.virustotal_api_key,
+            shodan_key=config.shodan_api_key,
+            censys_id=config.censys_api_id,
+            censys_secret=config.censys_api_secret,
             timeout=max(timeout, 15.0),
         )
         wildcard_task = detect_wildcard(domain, timeout)
@@ -258,6 +264,9 @@ async def analyze_domain(
                 skip=config.skip_passive,
                 securitytrails_key=config.securitytrails_api_key,
                 virustotal_key=config.virustotal_api_key,
+                shodan_key=config.shodan_api_key,
+                censys_id=config.censys_api_id,
+                censys_secret=config.censys_api_secret,
                 timeout=max(timeout, 15.0),
             )
             report.passive = passive_result
@@ -284,9 +293,15 @@ async def analyze_domain(
 
         tls_task = probe_tls(primary, 443, timeout, domain=domain)
 
-        # HTTP on both 443 and 80
-        http_443_task = probe_http(primary, 443, use_tls=True, timeout=timeout, domain=domain)
-        http_80_task = probe_http(primary, 80, use_tls=False, timeout=timeout, domain=domain)
+        # HTTP on both 443 and 80 (with retry)
+        http_443_task = retry_with_backoff(
+            lambda: probe_http(primary, 443, use_tls=True, timeout=timeout, domain=domain, proxy=config.proxy),
+            retries=config.retries,
+        )
+        http_80_task = retry_with_backoff(
+            lambda: probe_http(primary, 80, use_tls=False, timeout=timeout, domain=domain, proxy=config.proxy),
+            retries=config.retries,
+        )
 
         disc_results = await asyncio.gather(
             icmp_task, port_task, tls_task, http_443_task, http_80_task,
@@ -345,6 +360,27 @@ async def analyze_domain(
             http_result = disc_results[4]
             report.http = http_result
             reasoning.append(f"HTTP (80): {http_result.status_code} (server: {http_result.server_header or '?'})")
+
+        # WAF detection (from HTTP response)
+        if http_result:
+            report.waf = detect_waf(http_result)
+            if report.waf.detected:
+                reasoning.append(f"WAF detected: {report.waf.provider}")
+                if report.waf.is_blocking:
+                    reasoning.append("  WAF is actively blocking requests")
+
+        # ASN / geolocation lookup
+        try:
+            asn_info = await lookup_asn(primary, timeout=timeout)
+            report.asn = asn_info
+            if asn_info.asn:
+                reasoning.append(f"ASN: AS{asn_info.asn} ({asn_info.asn_org or '?'})")
+                if asn_info.country:
+                    reasoning.append(f"  Location: {asn_info.city or '?'}, {asn_info.country}")
+                if asn_info.is_cloud:
+                    reasoning.append(f"  Cloud: {asn_info.cloud_provider}")
+        except Exception as exc:
+            logger.debug("ASN lookup failed for %s: %s", primary, exc)
 
         # SMTP (if MX records exist)
         mx_records = dns_result.records.get("MX", []) if dns_result else []

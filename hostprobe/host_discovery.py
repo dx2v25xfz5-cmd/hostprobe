@@ -19,7 +19,7 @@ from hostprobe.models import (
     SMTPResult,
     TLSResult,
 )
-from hostprobe.utils import run_subprocess
+from hostprobe.utils import get_rate_limiter, random_user_agent, run_subprocess
 
 logger = logging.getLogger("hostprobe")
 
@@ -486,6 +486,7 @@ async def probe_http(
     use_tls: bool = True,
     timeout: float = 5.0,
     domain: str | None = None,
+    proxy: str | None = None,
 ) -> HTTPResult:
     """Make an HTTP request and inspect the response.
 
@@ -493,6 +494,11 @@ async def probe_http(
     405 Method Not Allowed.  Uses a custom Host header when *domain* is
     provided so that name-based virtual hosts respond correctly.
     """
+    # Rate limiting
+    limiter = get_rate_limiter()
+    if limiter:
+        await limiter.acquire()
+
     try:
         import aiohttp
 
@@ -501,7 +507,7 @@ async def probe_http(
 
         # Disable TLS verification — we handle that in probe_tls
         conn = aiohttp.TCPConnector(ssl=False)
-        headers = {}
+        headers = {"User-Agent": random_user_agent()}
         if domain and domain != host:
             headers["Host"] = domain
 

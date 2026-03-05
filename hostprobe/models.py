@@ -185,6 +185,36 @@ class EdgeCaseFlags:
 
 
 # ---------------------------------------------------------------------------
+# WAF Detection
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WAFResult:
+    """WAF / firewall detection result."""
+    detected: bool = False
+    provider: str | None = None          # e.g. "Cloudflare", "AWS WAF"
+    evidence: list[str] = field(default_factory=list)
+    is_blocking: bool = False            # True if WAF returned a challenge/block
+
+
+# ---------------------------------------------------------------------------
+# ASN / Geolocation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ASNInfo:
+    """ASN and IP geolocation data."""
+    ip: str = ""
+    asn: int | None = None
+    asn_org: str | None = None
+    isp: str | None = None
+    country: str | None = None
+    city: str | None = None
+    is_cloud: bool = False               # belongs to known cloud provider
+    cloud_provider: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Decommission
 # ---------------------------------------------------------------------------
 
@@ -235,6 +265,8 @@ class DomainReport:
     banners: list[BannerResult] = field(default_factory=list)
     edge_cases: EdgeCaseFlags = field(default_factory=EdgeCaseFlags)
     decommission: DecommissionSignals = field(default_factory=DecommissionSignals)
+    waf: WAFResult | None = None
+    asn: ASNInfo | None = None
 
     # Metadata
     scan_started: datetime | None = None

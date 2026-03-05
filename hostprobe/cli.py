@@ -12,6 +12,7 @@ from hostprobe.output import (
     BatchProgress,
     TerminalProgress,
     format_csv,
+    format_html,
     format_json,
     format_terminal,
     format_verdict_line,
@@ -66,6 +67,12 @@ def build_parser():
         action="store_true",
         dest="csv_output",
         help="Output CSV report (to stdout, or to file with -o)",
+    )
+    output_group.add_argument(
+        "--html",
+        action="store_true",
+        dest="html_output",
+        help="Output self-contained HTML report",
     )
     output_group.add_argument(
         "-o", "--output",
@@ -132,6 +139,53 @@ def build_parser():
         default=None,
         help="Path to config file (default: ~/.hostprobe.toml)",
     )
+    scan_group.add_argument(
+        "--rate-limit",
+        type=float,
+        default=None,
+        dest="rate_limit",
+        help="Max requests per second (0 = unlimited, default: 0)",
+    )
+    scan_group.add_argument(
+        "--proxy",
+        type=str,
+        default=None,
+        help="HTTP/SOCKS5 proxy URL (e.g. socks5://127.0.0.1:9050)",
+    )
+    scan_group.add_argument(
+        "--doh",
+        action="store_true",
+        dest="use_doh",
+        help="Use DNS-over-HTTPS (Cloudflare) instead of plain DNS",
+    )
+    scan_group.add_argument(
+        "--shodan-key",
+        type=str,
+        default=None,
+        dest="shodan_api_key",
+        help="Shodan API key for passive port/service data",
+    )
+    scan_group.add_argument(
+        "--censys-id",
+        type=str,
+        default=None,
+        dest="censys_api_id",
+        help="Censys API ID",
+    )
+    scan_group.add_argument(
+        "--censys-secret",
+        type=str,
+        default=None,
+        dest="censys_api_secret",
+        help="Censys API secret",
+    )
+    scan_group.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        dest="checkpoint_file",
+        help="Save/resume batch progress to this file",
+    )
 
     return parser
 
@@ -139,6 +193,14 @@ def build_parser():
 def _parse_args(argv: list[str] | None = None) -> tuple[Config, list[str]]:
     """Parse CLI args and return (Config, list_of_domains)."""
     parser = build_parser()
+
+    # Shell completion (if argcomplete is installed)
+    try:
+        import argcomplete
+        argcomplete.autocomplete(parser)
+    except ImportError:
+        pass
+
     args = parser.parse_args(argv)
 
     if not args.domain and not args.file:
@@ -179,6 +241,22 @@ def _parse_args(argv: list[str] | None = None) -> tuple[Config, list[str]]:
         overrides["json_output"] = True
     if args.csv_output:
         overrides["csv_output"] = True
+    if args.html_output:
+        overrides["html_output"] = True
+    if args.rate_limit is not None:
+        overrides["rate_limit"] = args.rate_limit
+    if args.proxy:
+        overrides["proxy"] = args.proxy
+    if args.use_doh:
+        overrides["use_doh"] = True
+    if args.shodan_api_key:
+        overrides["shodan_api_key"] = args.shodan_api_key
+    if args.censys_api_id:
+        overrides["censys_api_id"] = args.censys_api_id
+    if args.censys_api_secret:
+        overrides["censys_api_secret"] = args.censys_api_secret
+    if args.checkpoint_file:
+        overrides["checkpoint_file"] = args.checkpoint_file
     if args.output_file:
         overrides["output_file"] = args.output_file
     if args.verbose:
@@ -209,6 +287,20 @@ async def _run(config: Config, domains: list[str]) -> int:
     from hostprobe.output import _supports_color
     use_color = _supports_color() and not config.json_output
 
+    # Initialise rate limiter
+    if config.rate_limit and config.rate_limit > 0:
+        from hostprobe.utils import init_rate_limiter
+        init_rate_limiter(config.rate_limit)
+
+    # Load checkpoint (resume mode)
+    completed_domains: set[str] = set()
+    if config.checkpoint_file:
+        completed_domains = _load_checkpoint(config.checkpoint_file)
+        if completed_domains:
+            domains = [d for d in domains if d not in completed_domains]
+            if not config.quiet:
+                sys.stderr.write(f"  Resuming — {len(completed_domains)} domains already done\n")
+
     reports = []
 
     if len(domains) == 1:
@@ -222,13 +314,19 @@ async def _run(config: Config, domains: list[str]) -> int:
     else:
         # Batch mode
         batch_progress = BatchProgress(len(domains), use_color, config.quiet)
-        for domain in domains:
+        for i, domain in enumerate(domains, 1):
             progress = batch_progress.start_domain(domain)
             report = await analyze_domain(domain, config, progress)
             reports.append(report)
+            # Save checkpoint after each domain
+            if config.checkpoint_file:
+                _save_checkpoint(config.checkpoint_file, completed_domains | {r.domain for r in reports})
+        batch_progress.summary()
 
     # Output
-    if config.csv_output:
+    if config.html_output:
+        sys.stdout.write(format_html(reports))
+    elif config.csv_output:
         sys.stdout.write(format_csv(reports))
     elif config.json_output:
         if len(reports) == 1:
@@ -245,7 +343,9 @@ async def _run(config: Config, domains: list[str]) -> int:
     # Write to file if requested
     if config.output_file:
         output_path = Path(config.output_file)
-        if config.csv_output:
+        if config.html_output:
+            output_path.write_text(format_html(reports))
+        elif config.csv_output:
             output_path.write_text(format_csv(reports))
         elif len(reports) == 1:
             output_path.write_text(format_json(reports[0]) + "\n")
@@ -259,6 +359,26 @@ async def _run(config: Config, domains: list[str]) -> int:
         return reports[0].verdict.exit_code
     else:
         return min(r.verdict.exit_code for r in reports)
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint helpers
+# ---------------------------------------------------------------------------
+
+def _load_checkpoint(path: str) -> set[str]:
+    """Load completed domains from a checkpoint file."""
+    import json
+    try:
+        data = Path(path).read_text()
+        return set(json.loads(data).get("completed", []))
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return set()
+
+
+def _save_checkpoint(path: str, completed: set[str]) -> None:
+    """Save completed domains to a checkpoint file."""
+    import json
+    Path(path).write_text(json.dumps({"completed": sorted(completed)}))
 
 
 def main(argv: list[str] | None = None) -> None:

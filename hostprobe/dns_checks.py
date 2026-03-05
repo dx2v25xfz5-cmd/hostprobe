@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from typing import Any
 
+import aiohttp
 import dns.asyncresolver
 import dns.flags
+import dns.message
 import dns.name
 import dns.rdatatype
 import dns.resolver
@@ -18,6 +21,46 @@ from hostprobe.utils import retry_with_backoff
 logger = logging.getLogger("hostprobe")
 
 RECORD_TYPES = ("A", "AAAA", "MX", "TXT", "NS", "SOA", "CAA", "SRV", "CNAME")
+
+DOH_ENDPOINT = "https://cloudflare-dns.com/dns-query"
+
+
+# ---------------------------------------------------------------------------
+# DNS-over-HTTPS helper
+# ---------------------------------------------------------------------------
+
+async def _query_doh(
+    domain: str,
+    rdtype: str,
+    timeout: float = 5.0,
+) -> tuple[str, DNSClassification, list[str]]:
+    """Resolve a DNS query via DNS-over-HTTPS (Cloudflare)."""
+    try:
+        q = dns.message.make_query(domain, rdtype)
+        wire = q.to_wire()
+        b64 = base64.urlsafe_b64encode(wire).rstrip(b"=").decode()
+        url = f"{DOH_ENDPOINT}?dns={b64}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                headers={"Accept": "application/dns-message"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                data = await resp.read()
+                msg = dns.message.from_wire(data)
+                values: list[str] = []
+                for rrset in msg.answer:
+                    for rdata in rrset:
+                        values.append(rdata.to_text())
+                rcode = msg.rcode()
+                if rcode == 3:  # NXDOMAIN
+                    return ("DoH", DNSClassification.NXDOMAIN, [])
+                if values:
+                    return ("DoH", DNSClassification.RESOLVED, values)
+                return ("DoH", DNSClassification.NOERROR_NODATA, [])
+    except Exception as exc:
+        logger.debug("DoH query failed for %s/%s: %s", domain, rdtype, exc)
+        return ("DoH", DNSClassification.SERVFAIL, [])
 
 
 # ---------------------------------------------------------------------------
@@ -56,20 +99,24 @@ async def classify_dns(
     domain: str,
     resolvers: list[str] | None = None,
     timeout: float = 5.0,
+    use_doh: bool = False,
 ) -> DNSResult:
     """Classify a domain's DNS status across multiple resolvers.
 
     Queries system default + all supplied resolvers concurrently.
+    When *use_doh* is ``True``, also queries via DNS-over-HTTPS.
     Returns the consensus classification.
     """
     resolver_list: list[str | None] = [None]  # system default first
     if resolvers:
         resolver_list.extend(resolvers)
 
-    tasks = [
+    tasks: list[Any] = [
         _query_resolver(domain, "A", r, timeout)
         for r in resolver_list
     ]
+    if use_doh:
+        tasks.append(_query_doh(domain, "A", timeout))
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     # Collect classifications across resolvers

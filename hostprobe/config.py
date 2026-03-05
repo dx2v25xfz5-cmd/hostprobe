@@ -37,6 +37,7 @@ class Config:
     # DNS
     resolvers: list[str] = field(default_factory=lambda: list(DEFAULT_RESOLVERS))
     dns_timeout: float = DEFAULT_TIMEOUT
+    use_doh: bool = False               # DNS-over-HTTPS
 
     # Ports
     ports: list[int] = field(default_factory=lambda: list(DEFAULT_PORTS))
@@ -44,13 +45,21 @@ class Config:
     # Subdomains
     subdomain_wordlist: list[str] = field(default_factory=lambda: list(DEFAULT_SUBDOMAINS))
 
-    # Concurrency / retry
+    # Concurrency / retry / rate-limiting
     concurrency: int = DEFAULT_CONCURRENCY
     retries: int = DEFAULT_RETRIES
+    rate_limit: float = 0.0             # requests/sec, 0 = unlimited
+
+    # Network
+    proxy: str | None = None            # HTTP/SOCKS5 proxy URL
+    timeout: float = DEFAULT_TIMEOUT
 
     # API keys
     securitytrails_api_key: str | None = None
     virustotal_api_key: str | None = None
+    shodan_api_key: str | None = None
+    censys_api_id: str | None = None
+    censys_api_secret: str | None = None
 
     # Optional flags
     use_nmap: bool = False
@@ -58,12 +67,15 @@ class Config:
     skip_passive: bool = False
     verbose: bool = False
     quiet: bool = False
-    timeout: float = DEFAULT_TIMEOUT
 
     # Output
     json_output: bool = False
     csv_output: bool = False
+    html_output: bool = False
     output_file: str | None = None
+
+    # Checkpoint / resume
+    checkpoint_file: str | None = None
 
 
 def load_config(
@@ -110,12 +122,26 @@ def load_config(
             cfg.securitytrails_api_key = keys_sec["securitytrails"]
         if "virustotal" in keys_sec:
             cfg.virustotal_api_key = keys_sec["virustotal"]
+        if "shodan" in keys_sec:
+            cfg.shodan_api_key = keys_sec["shodan"]
+        if "censys_id" in keys_sec:
+            cfg.censys_api_id = keys_sec["censys_id"]
+        if "censys_secret" in keys_sec:
+            cfg.censys_api_secret = keys_sec["censys_secret"]
 
     # --- Layer 2: environment variables ---
     if env_st := os.environ.get("SECURITYTRAILS_API_KEY"):
         cfg.securitytrails_api_key = env_st
     if env_vt := os.environ.get("VIRUSTOTAL_API_KEY"):
         cfg.virustotal_api_key = env_vt
+    if env_sh := os.environ.get("SHODAN_API_KEY"):
+        cfg.shodan_api_key = env_sh
+    if env_ci := os.environ.get("CENSYS_API_ID"):
+        cfg.censys_api_id = env_ci
+    if env_cs := os.environ.get("CENSYS_API_SECRET"):
+        cfg.censys_api_secret = env_cs
+    if env_proxy := os.environ.get("HOSTPROBE_PROXY"):
+        cfg.proxy = env_proxy
 
     # --- Layer 3: CLI overrides (highest priority) ---
     if cli_overrides:

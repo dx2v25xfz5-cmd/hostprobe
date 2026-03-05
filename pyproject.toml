@@ -17,10 +17,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+proxy = [
+    "aiohttp-socks>=0.8",
+]
+completion = [
+    "argcomplete>=3.0",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
     "aioresponses>=0.7",
+]
+all = [
+    "aiohttp-socks>=0.8",
+    "argcomplete>=3.0",
 ]
 
 [project.scripts]

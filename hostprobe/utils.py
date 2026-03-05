@@ -1,15 +1,92 @@
-"""Shared async utilities: retry, subprocess wrapper, concurrency helpers."""
+"""Shared async utilities: retry, subprocess wrapper, concurrency helpers, rate limiting."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import sys
+import time
 from typing import Any, Awaitable, Callable, TypeVar
 
 T = TypeVar("T")
 
 logger = logging.getLogger("hostprobe")
+
+
+# ---------------------------------------------------------------------------
+# User-Agent rotation
+# ---------------------------------------------------------------------------
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+]
+
+
+def random_user_agent() -> str:
+    """Return a random realistic browser User-Agent string."""
+    return random.choice(_USER_AGENTS)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (token bucket)
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """Async token-bucket rate limiter.
+
+    Allows *rate* operations per second with optional burst capacity.
+    """
+
+    def __init__(self, rate: float = 10.0, burst: int = 0):
+        self._rate = rate
+        self._burst = burst or int(rate)
+        self._tokens = float(self._burst)
+        self._last = time.monotonic()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        """Wait until a token is available."""
+        async with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last
+            self._tokens = min(self._burst, self._tokens + elapsed * self._rate)
+            self._last = now
+
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return
+
+            wait = (1.0 - self._tokens) / self._rate
+            self._tokens = 0.0
+
+        await asyncio.sleep(wait)
+
+    @property
+    def rate(self) -> float:
+        return self._rate
+
+
+# Global rate limiter — initialised from Config before scan starts
+_global_limiter: RateLimiter | None = None
+
+
+def init_rate_limiter(rate: float, burst: int = 0) -> RateLimiter:
+    """Create and set the global rate limiter."""
+    global _global_limiter
+    _global_limiter = RateLimiter(rate=rate, burst=burst)
+    return _global_limiter
+
+
+def get_rate_limiter() -> RateLimiter | None:
+    """Return the global rate limiter (may be None if rate-limiting is off)."""
+    return _global_limiter
 
 
 # ---------------------------------------------------------------------------
