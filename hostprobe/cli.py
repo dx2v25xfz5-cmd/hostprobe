@@ -187,11 +187,28 @@ def build_parser():
         help="Save/resume batch progress to this file",
     )
 
+    # Storage
+    storage_group = parser.add_argument_group("storage")
+    storage_group.add_argument(
+        "--db",
+        type=str,
+        default=None,
+        dest="db_path",
+        help="SQLite database path for persistent storage",
+    )
+    storage_group.add_argument(
+        "--client",
+        type=str,
+        default=None,
+        dest="client",
+        help="Client/project name for multi-tenant DB storage (required with --db)",
+    )
+
     return parser
 
 
-def _parse_args(argv: list[str] | None = None) -> tuple[Config, list[str]]:
-    """Parse CLI args and return (Config, list_of_domains)."""
+def _parse_args(argv: list[str] | None = None) -> tuple[Config, list[str], dict[str, str]]:
+    """Parse CLI args and return (Config, list_of_domains, domain_clients_map)."""
     parser = build_parser()
 
     # Shell completion (if argcomplete is installed)
@@ -208,17 +225,40 @@ def _parse_args(argv: list[str] | None = None) -> tuple[Config, list[str]]:
 
     # Collect domains
     domains: list[str] = []
+    # Per-domain client mapping (populated from CSV files)
+    domain_clients: dict[str, str] = {}
+
     if args.domain:
         domains.append(args.domain.strip().lower())
     if args.file:
         path = Path(args.file)
         if not path.exists():
             parser.error(f"file not found: {args.file}")
-        domains.extend(
-            line.strip().lower()
-            for line in path.read_text().splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        )
+        if path.suffix.lower() == ".csv":
+            # CSV file — look for 'domain' and optional 'client' columns
+            import csv as _csv
+            with open(path, newline="") as fh:
+                reader = _csv.DictReader(fh)
+                if not reader.fieldnames or "domain" not in [f.lower().strip() for f in reader.fieldnames]:
+                    parser.error("CSV file must have a 'domain' column")
+                # Normalise headers
+                domain_col = next(f for f in reader.fieldnames if f.lower().strip() == "domain")
+                client_col = next(
+                    (f for f in reader.fieldnames if f.lower().strip() == "client"), None
+                )
+                for row in reader:
+                    d = row[domain_col].strip().lower()
+                    if d and not d.startswith("#"):
+                        domains.append(d)
+                        if client_col and row.get(client_col, "").strip():
+                            domain_clients[d] = row[client_col].strip()
+        else:
+            # Plain text — one domain per line
+            domains.extend(
+                line.strip().lower()
+                for line in path.read_text().splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            )
 
     if not domains:
         parser.error("no domains to scan")
@@ -257,6 +297,10 @@ def _parse_args(argv: list[str] | None = None) -> tuple[Config, list[str]]:
         overrides["censys_api_secret"] = args.censys_api_secret
     if args.checkpoint_file:
         overrides["checkpoint_file"] = args.checkpoint_file
+    if args.db_path:
+        overrides["db_path"] = args.db_path
+    if args.client:
+        overrides["client"] = args.client
     if args.output_file:
         overrides["output_file"] = args.output_file
     if args.verbose:
@@ -279,11 +323,17 @@ def _parse_args(argv: list[str] | None = None) -> tuple[Config, list[str]]:
     config_path = Path(args.config) if args.config else None
     config = load_config(config_path=config_path, cli_overrides=overrides)
 
-    return config, domains
+    # Validate: --db requires --client (unless CSV provides per-row clients)
+    if config.db_path and not config.client and not domain_clients:
+        parser.error("--client is required when using --db (or use a CSV file with a 'client' column)")
+
+    return config, domains, domain_clients
 
 
-async def _run(config: Config, domains: list[str]) -> int:
+async def _run(config: Config, domains: list[str], domain_clients: dict[str, str] | None = None) -> int:
     """Run the scan and return the appropriate exit code."""
+    if domain_clients is None:
+        domain_clients = {}
     from hostprobe.output import _supports_color
     use_color = _supports_color() and not config.json_output
 
@@ -340,6 +390,22 @@ async def _run(config: Config, domains: list[str]) -> int:
         for report in reports:
             sys.stdout.write(format_terminal(report, use_color) + "\n")
 
+    # Save to SQLite if requested
+    if config.db_path:
+        from hostprobe.storage import HostprobeDB
+        with HostprobeDB(config.db_path) as db:
+            for report in reports:
+                # Client resolution: per-domain (CSV) > --client flag > config
+                client_name = domain_clients.get(report.domain) or config.client
+                if client_name:
+                    db.save_report(client_name, report)
+            if not config.quiet:
+                client_label = config.client or "per-CSV"
+                sys.stderr.write(
+                    f"  {len(reports)} result(s) saved to {config.db_path}"
+                    f" (client: {client_label})\n"
+                )
+
     # Write to file if requested
     if config.output_file:
         output_path = Path(config.output_file)
@@ -384,14 +450,14 @@ def _save_checkpoint(path: str, completed: set[str]) -> None:
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
     try:
-        config, domains = _parse_args(argv)
+        config, domains, domain_clients = _parse_args(argv)
     except SystemExit:
         raise
 
     setup_logging(config.verbose)
 
     try:
-        exit_code = asyncio.run(_run(config, domains))
+        exit_code = asyncio.run(_run(config, domains, domain_clients))
     except KeyboardInterrupt:
         sys.stderr.write("\n  Interrupted.\n")
         sys.exit(130)

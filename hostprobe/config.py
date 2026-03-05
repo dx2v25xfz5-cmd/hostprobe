@@ -77,6 +77,10 @@ class Config:
     # Checkpoint / resume
     checkpoint_file: str | None = None
 
+    # SQLite storage
+    db_path: str | None = None
+    client: str | None = None
+
 
 def load_config(
     config_path: Path | None = None,
@@ -129,6 +133,12 @@ def load_config(
         if "censys_secret" in keys_sec:
             cfg.censys_api_secret = keys_sec["censys_secret"]
 
+        storage_sec = data.get("storage", {})
+        if "db_path" in storage_sec:
+            cfg.db_path = storage_sec["db_path"]
+        if "client" in storage_sec:
+            cfg.client = storage_sec["client"]
+
     # --- Layer 2: environment variables ---
     if env_st := os.environ.get("SECURITYTRAILS_API_KEY"):
         cfg.securitytrails_api_key = env_st
@@ -142,6 +152,10 @@ def load_config(
         cfg.censys_api_secret = env_cs
     if env_proxy := os.environ.get("HOSTPROBE_PROXY"):
         cfg.proxy = env_proxy
+    if env_db := os.environ.get("HOSTPROBE_DB"):
+        cfg.db_path = env_db
+    if env_client := os.environ.get("HOSTPROBE_CLIENT"):
+        cfg.client = env_client
 
     # --- Layer 3: CLI overrides (highest priority) ---
     if cli_overrides:
