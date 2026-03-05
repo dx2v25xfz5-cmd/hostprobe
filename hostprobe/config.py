@@ -62,6 +62,7 @@ class Config:
 
     # Output
     json_output: bool = False
+    csv_output: bool = False
     output_file: str | None = None
 
 

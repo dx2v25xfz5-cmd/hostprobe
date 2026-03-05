@@ -11,6 +11,7 @@ from hostprobe.models import Verdict
 from hostprobe.output import (
     BatchProgress,
     TerminalProgress,
+    format_csv,
     format_json,
     format_terminal,
     format_verdict_line,
@@ -59,6 +60,12 @@ def build_parser():
         action="store_true",
         dest="json_output",
         help="Output JSON only (to stdout)",
+    )
+    output_group.add_argument(
+        "--csv",
+        action="store_true",
+        dest="csv_output",
+        help="Output CSV report (to stdout, or to file with -o)",
     )
     output_group.add_argument(
         "-o", "--output",
@@ -170,6 +177,8 @@ def _parse_args(argv: list[str] | None = None) -> tuple[Config, list[str]]:
         overrides["internal_resolver"] = args.internal_resolver
     if args.json_output:
         overrides["json_output"] = True
+    if args.csv_output:
+        overrides["csv_output"] = True
     if args.output_file:
         overrides["output_file"] = args.output_file
     if args.verbose:
@@ -219,7 +228,9 @@ async def _run(config: Config, domains: list[str]) -> int:
             reports.append(report)
 
     # Output
-    if config.json_output:
+    if config.csv_output:
+        sys.stdout.write(format_csv(reports))
+    elif config.json_output:
         if len(reports) == 1:
             sys.stdout.write(format_json(reports[0]) + "\n")
         else:
@@ -234,7 +245,9 @@ async def _run(config: Config, domains: list[str]) -> int:
     # Write to file if requested
     if config.output_file:
         output_path = Path(config.output_file)
-        if len(reports) == 1:
+        if config.csv_output:
+            output_path.write_text(format_csv(reports))
+        elif len(reports) == 1:
             output_path.write_text(format_json(reports[0]) + "\n")
         else:
             output_path.write_text(format_json(reports) + "\n")
