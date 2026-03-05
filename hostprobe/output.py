@@ -259,6 +259,11 @@ def format_terminal(report: DomainReport, use_color: bool | None = None) -> str:
             lines.append(f"  Expires        : {exp_str}")
         match_str = _c(C.GREEN, "Yes", use_color) if t.cert_matches_domain else _c(C.RED, "No", use_color)
         lines.append(f"  Matches Domain : {match_str}")
+    elif report.tls and not report.tls.handshake_ok:
+        lines.append("")
+        lines.append(_section("TLS", use_color))
+        reason = report.tls.error_reason or "unknown"
+        lines.append(f"  Handshake      : {_c(C.RED, f'FAILED ({reason})', use_color)}")
 
     # SMTP
     if report.smtp and report.smtp.responsive:

@@ -285,8 +285,8 @@ async def analyze_domain(
         tls_task = probe_tls(primary, 443, timeout, domain=domain)
 
         # HTTP on both 443 and 80
-        http_443_task = probe_http(primary, 443, use_tls=True, timeout=timeout)
-        http_80_task = probe_http(primary, 80, use_tls=False, timeout=timeout)
+        http_443_task = probe_http(primary, 443, use_tls=True, timeout=timeout, domain=domain)
+        http_80_task = probe_http(primary, 80, use_tls=False, timeout=timeout, domain=domain)
 
         disc_results = await asyncio.gather(
             icmp_task, port_task, tls_task, http_443_task, http_80_task,
@@ -330,7 +330,8 @@ async def analyze_domain(
                 elif report.tls.expires_soon:
                     reasoning.append("  NOTE: Certificate expires within 30 days")
             else:
-                reasoning.append("TLS handshake: FAILED")
+                reason = report.tls.error_reason or "unknown"
+                reasoning.append(f"TLS handshake: FAILED ({reason})")
 
         # HTTP
         http_result = None

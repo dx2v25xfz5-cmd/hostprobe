@@ -137,6 +137,7 @@ class TLSResult:
     expires_soon: bool = False          # < 30 days
     tls_version: str | None = None
     cert_matches_domain: bool = False
+    error_reason: str | None = None     # why handshake failed
 
 
 @dataclass
