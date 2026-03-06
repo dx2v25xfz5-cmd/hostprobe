@@ -18,6 +18,7 @@ from hostprobe.db_cli import (
     _format_table,
     _print_clients_table,
     _print_domain_history,
+    _print_dump,
     _print_full_report,
     _print_scans_table,
     _truncate,
@@ -412,6 +413,84 @@ class TestDbMain:
         out = capsys.readouterr().out
         assert "alpha.com" in out
         assert "beta.com" not in out
+
+
+# ---------------------------------------------------------------------------
+# Dump tests (--dump: full data pretty cards)
+# ---------------------------------------------------------------------------
+
+
+class TestPrintDump:
+    def test_prints_all_fields(self, populated_db, capsys):
+        with HostprobeDB(populated_db) as db:
+            count = _print_dump(db)
+        out = capsys.readouterr().out
+        assert count == 4
+        assert "alpha.com" in out
+        assert "[GENERAL]" in out
+        assert "[DNS]" in out
+        assert "[WHOIS]" in out
+        assert "[CONNECTIVITY]" in out
+        assert "[HTTP]" in out
+
+    def test_filter_by_client(self, populated_db, capsys):
+        with HostprobeDB(populated_db) as db:
+            count = _print_dump(db, client="ClientA")
+        out = capsys.readouterr().out
+        assert count == 2
+        assert "alpha.com" in out
+        assert "gamma.org" not in out
+
+    def test_filter_by_verdict(self, populated_db, capsys):
+        with HostprobeDB(populated_db) as db:
+            count = _print_dump(db, verdict="alive")
+        out = capsys.readouterr().out
+        assert count == 1
+        assert "alpha.com" in out
+
+    def test_no_results(self, populated_db, capsys):
+        with HostprobeDB(populated_db) as db:
+            count = _print_dump(db, client="NoSuch")
+        assert count == 0
+
+    def test_contains_dns_records(self, populated_db, capsys):
+        with HostprobeDB(populated_db) as db:
+            count = _print_dump(db)
+        out = capsys.readouterr().out
+        # Should contain actual DNS data from the report
+        assert "1.2.3.4" in out or "ns1.test.com" in out
+
+
+class TestDbMainDump:
+    def test_dump_flag(self, populated_db, capsys):
+        with pytest.raises(SystemExit) as exc:
+            db_main([str(populated_db), "--dump"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "[GENERAL]" in out
+        assert "[DNS]" in out
+        assert "alpha.com" in out
+
+    def test_dump_with_csv(self, populated_db, tmp_path, capsys):
+        csv_path = str(tmp_path / "dump.csv")
+        with pytest.raises(SystemExit) as exc:
+            db_main([str(populated_db), "--dump", "--export-csv", csv_path])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "[GENERAL]" in out
+        assert Path(csv_path).exists()
+        with open(csv_path) as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+        assert len(rows) == 4
+
+    def test_dump_with_filter(self, populated_db, capsys):
+        with pytest.raises(SystemExit) as exc:
+            db_main([str(populated_db), "--dump", "--client", "ClientB"])
+        assert exc.value.code == 0
+        out = capsys.readouterr().out
+        assert "gamma.org" in out
+        assert "alpha.com" not in out
 
 
 # ---------------------------------------------------------------------------

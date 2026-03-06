@@ -558,6 +558,202 @@ def _print_domain_history(db: HostprobeDB, domain: str, client: str | None = Non
 
 
 # ---------------------------------------------------------------------------
+# Dump: detailed pretty table with ALL fields per scan
+# ---------------------------------------------------------------------------
+
+# Section definitions: (section_label, [(display_label, flat_key), ...])
+_DUMP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("GENERAL", [
+        ("ID", "id"),
+        ("Client", "client"),
+        ("Domain", "domain"),
+        ("Verdict", "verdict"),
+        ("Scan Started", "scan_started"),
+        ("Scan Finished", "scan_finished"),
+        ("Duration", "scan_duration_s"),
+        ("Stored At", "created_at"),
+    ]),
+    ("DNS", [
+        ("Classification", "dns_classification"),
+        ("Response Code", "dns_rcode"),
+        ("DNSSEC", "dns_dnssec"),
+        ("A Records", "dns_records_a"),
+        ("AAAA Records", "dns_records_aaaa"),
+        ("MX Records", "dns_records_mx"),
+        ("NS Records", "dns_records_ns"),
+        ("TXT Records", "dns_records_txt"),
+        ("CNAME Records", "dns_records_cname"),
+        ("CNAME Chain", "dns_cname_chain"),
+    ]),
+    ("WHOIS", [
+        ("Registered", "whois_registered"),
+        ("Registrar", "whois_registrar"),
+        ("Expiry Date", "whois_expiry_date"),
+        ("Nameservers", "whois_nameservers"),
+    ]),
+    ("CONNECTIVITY", [
+        ("ICMP Reachable", "icmp_reachable"),
+        ("ICMP Latency", "icmp_latency_ms"),
+        ("Open Ports", "open_ports"),
+        ("Closed Ports", "closed_ports"),
+        ("Filtered Ports", "filtered_ports"),
+    ]),
+    ("TLS", [
+        ("Handshake OK", "tls_handshake_ok"),
+        ("Version", "tls_version"),
+        ("Cert CN", "tls_cert_cn"),
+        ("Issuer", "tls_issuer"),
+        ("Not After", "tls_not_after"),
+        ("Expired", "tls_expired"),
+        ("Matches Domain", "tls_matches_domain"),
+    ]),
+    ("HTTP", [
+        ("Status", "http_status"),
+        ("Server", "http_server"),
+        ("Redirect", "http_redirect"),
+    ]),
+    ("SMTP", [
+        ("Responsive", "smtp_responsive"),
+        ("Banner", "smtp_banner"),
+    ]),
+    ("WAF / FIREWALL", [
+        ("Detected", "waf_detected"),
+        ("Provider", "waf_provider"),
+    ]),
+    ("ASN / GEO", [
+        ("IP", "asn_ip"),
+        ("ASN", "asn_number"),
+        ("Organization", "asn_org"),
+        ("Country", "asn_country"),
+    ]),
+    ("SUBDOMAINS", [
+        ("Found", "subdomains_found"),
+    ]),
+    ("DECOMMISSION", [
+        ("Likely", "decommission_likely"),
+    ]),
+    ("REASONING", [
+        ("Reasoning", "reasoning"),
+    ]),
+]
+
+
+def _print_dump_card(flat: dict[str, str], color: bool) -> str:
+    """Render a single scan as a vertical key-value card."""
+    lines: list[str] = []
+    sep = _c(_C.DIM, "━" * 72, color)
+
+    # Title bar
+    domain = flat.get("domain", "?")
+    scan_id = flat.get("id", "?")
+    client = flat.get("client", "?")
+    verdict = flat.get("verdict", "?").upper().replace("_", " ")
+
+    verdict_clr = {
+        "ALIVE": _C.GREEN, "LIKELY DEAD": _C.RED, "FILTERED": _C.YELLOW,
+        "PARTIAL": _C.YELLOW, "INVESTIGATE": _C.MAGENTA,
+        "RECENTLY DECOMMISSIONED": _C.CYAN,
+    }.get(verdict, _C.WHITE)
+
+    lines.append("")
+    lines.append(sep)
+    lines.append(
+        f"  {_c(_C.BOLD, f'#{scan_id}', color)}"
+        f"  {_c(_C.BOLD, domain, color)}"
+        f"  {_c(verdict_clr + _C.BOLD, verdict, color)}"
+        f"  {_c(_C.DIM, f'({client})', color)}"
+    )
+    lines.append(sep)
+
+    for section_label, fields in _DUMP_SECTIONS:
+        # Gather non-empty values for this section
+        section_rows: list[tuple[str, str]] = []
+        for display_label, key in fields:
+            val = flat.get(key, "")
+            if val and val not in ("", "None", "False"):
+                section_rows.append((display_label, val))
+
+        if not section_rows:
+            continue
+
+        # Section header
+        lines.append(f"  {_c(_C.BOLD + _C.BLUE, f'[{section_label}]', color)}")
+
+        label_width = max(len(lbl) for lbl, _ in section_rows)
+        for label, value in section_rows:
+            # Color special values
+            display_val = value
+            if key == "verdict":
+                pass  # already in header
+            elif value.lower() == "true":
+                display_val = _c(_C.GREEN, value, color)
+            elif value.lower() == "false":
+                display_val = _c(_C.RED, value, color)
+
+            # Wrap long values
+            max_val_width = 58
+            if len(value) > max_val_width:
+                # Multi-line: first line + continuation
+                chunks = [value[i:i + max_val_width] for i in range(0, len(value), max_val_width)]
+                lines.append(f"    {label:<{label_width}s} : {chunks[0]}")
+                for chunk in chunks[1:]:
+                    lines.append(f"    {' ' * label_width}   {chunk}")
+            else:
+                lines.append(f"    {label:<{label_width}s} : {display_val}")
+
+        lines.append("")  # blank line between sections
+
+    return "\n".join(lines)
+
+
+def _print_dump(
+    db: HostprobeDB,
+    client: str | None = None,
+    domain: str | None = None,
+    verdict: str | None = None,
+    limit: int = 50,
+) -> int:
+    """Print a full data dump with all fields in pretty vertical cards."""
+    color = _use_color()
+    rows = db.get_reports(
+        client=client, domain=domain, verdict=verdict, limit=limit
+    )
+
+    if not rows:
+        msg = "No scans found"
+        flt = []
+        if client:
+            flt.append(f"client={client}")
+        if domain:
+            flt.append(f"domain={domain}")
+        if verdict:
+            flt.append(f"verdict={verdict}")
+        if flt:
+            msg += f" ({', '.join(flt)})"
+        sys.stderr.write(f"  {msg}\n")
+        return 0
+
+    total = db.count_scans(client=client, domain=domain, verdict=verdict)
+    count = 0
+
+    for row in rows:
+        full = db.get_full_report(row["id"])
+        if full:
+            flat = _flatten_report_row(full)
+            sys.stdout.write(_print_dump_card(flat, color) + "\n")
+            count += 1
+
+    if total > limit:
+        sys.stderr.write(
+            f"\n  Showing {count} of {total} scans (use --limit to see more)\n"
+        )
+    else:
+        sys.stderr.write(f"\n  {count} scan(s) dumped\n")
+
+    return count
+
+
+# ---------------------------------------------------------------------------
 # Argument parser & entry point
 # ---------------------------------------------------------------------------
 
@@ -572,12 +768,14 @@ def build_db_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  hostprobe db results.db                         # list all scans\n"
+            "  hostprobe db results.db                         # summary table\n"
+            "  hostprobe db results.db --dump                  # ALL data, pretty cards\n"
             "  hostprobe db results.db --client acme           # filter by client\n"
             "  hostprobe db results.db --verdict alive          # filter by verdict\n"
-            "  hostprobe db results.db --export-csv out.csv    # export to CSV\n"
+            "  hostprobe db results.db --export-csv out.csv    # export ALL to CSV\n"
+            "  hostprobe db results.db --dump --export-csv o.csv  # both at once\n"
             "  hostprobe db results.db --clients               # list clients\n"
-            "  hostprobe db results.db --full 42               # full report for scan #42\n"
+            "  hostprobe db results.db --full 42               # full JSON for scan #42\n"
             "  hostprobe db results.db --history example.com   # domain scan history\n"
         ),
     )
@@ -589,6 +787,11 @@ def build_db_parser() -> argparse.ArgumentParser:
 
     # View modes
     view_group = parser.add_argument_group("view")
+    view_group.add_argument(
+        "--dump",
+        action="store_true",
+        help="Show ALL data fields in detailed pretty cards per scan",
+    )
     view_group.add_argument(
         "--clients",
         action="store_true",
@@ -665,7 +868,19 @@ def db_main(argv: list[str]) -> None:
             "limit": args.limit,
         }
 
-        # Export mode
+        # Handle --dump + --export-csv together ("both")
+        ok = True
+
+        if args.dump:
+            count = _print_dump(
+                db,
+                client=args.client,
+                domain=args.domain,
+                verdict=args.verdict,
+                limit=args.limit,
+            )
+            ok = count > 0
+
         if args.export_csv:
             if args.export_csv == "-":
                 count = export_csv_stdout(db, **filters)
@@ -675,7 +890,10 @@ def db_main(argv: list[str]) -> None:
                     sys.stderr.write(f"  Exported {count} scan(s) to {args.export_csv}\n")
                 else:
                     sys.stderr.write("  No scans found to export.\n")
-            sys.exit(0 if count else 1)
+            ok = ok and count > 0
+
+        if args.dump or args.export_csv:
+            sys.exit(0 if ok else 1)
 
         # View modes
         if args.clients:
