@@ -334,7 +334,8 @@ class HostprobeDB:
         }
 
     def count_scans(
-        self, client: str | None = None, domain: str | None = None
+        self, client: str | None = None, domain: str | None = None,
+        verdict: str | None = None,
     ) -> int:
         """Count scans matching the given filters."""
         clauses: list[str] = []
@@ -345,6 +346,9 @@ class HostprobeDB:
         if domain:
             clauses.append("s.domain = ?")
             params.append(domain)
+        if verdict:
+            clauses.append("s.verdict = ?")
+            params.append(verdict)
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         row = self._conn.execute(
             f"""

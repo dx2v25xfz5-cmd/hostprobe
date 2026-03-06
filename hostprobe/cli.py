@@ -449,6 +449,13 @@ def _save_checkpoint(path: str, completed: set[str]) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     """CLI entry point."""
+    # Route to `db` subcommand if first arg is "db"
+    args = argv if argv is not None else sys.argv[1:]
+    if args and args[0] == "db":
+        from hostprobe.db_cli import db_main
+        db_main(args[1:])
+        return
+
     try:
         config, domains, domain_clients = _parse_args(argv)
     except SystemExit:
