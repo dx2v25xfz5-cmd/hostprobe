@@ -897,7 +897,7 @@ def build_db_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         default=50,
-        help="Maximum rows to display (default: 50)",
+        help="Maximum rows to display (default: 50, 0 = no limit)",
     )
 
     # Export

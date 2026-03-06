@@ -244,6 +244,13 @@ class HostprobeDB:
 
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
 
+        if limit:
+            limit_clause = "LIMIT ? OFFSET ?"
+            extra_params = (limit, offset)
+        else:
+            limit_clause = ""
+            extra_params = ()
+
         rows = self._conn.execute(
             f"""
             SELECT s.id, c.name AS client, s.domain, s.verdict,
@@ -253,9 +260,9 @@ class HostprobeDB:
             JOIN clients c ON c.id = s.client_id
             {where}
             ORDER BY s.created_at DESC
-            LIMIT ? OFFSET ?
+            {limit_clause}
             """,
-            (*params, limit, offset),
+            (*params, *extra_params),
         ).fetchall()
         return [dict(r) for r in rows]
 
