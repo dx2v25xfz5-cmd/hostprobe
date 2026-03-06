@@ -167,8 +167,10 @@ _EXPORT_COLUMNS = [
     "dns_dnssec",
     "whois_registered",
     "whois_registrar",
+    "whois_creation_date",
     "whois_expiry_date",
     "whois_nameservers",
+    "whois_recently_expired",
     "icmp_reachable",
     "icmp_latency_ms",
     "open_ports",
@@ -177,23 +179,46 @@ _EXPORT_COLUMNS = [
     "tls_handshake_ok",
     "tls_version",
     "tls_cert_cn",
+    "tls_cert_san",
     "tls_issuer",
+    "tls_not_before",
     "tls_not_after",
     "tls_expired",
     "tls_matches_domain",
+    "tls_error_reason",
     "http_status",
     "http_server",
     "http_redirect",
     "smtp_responsive",
     "smtp_banner",
+    "smtp_starttls",
     "subdomains_found",
+    "ct_entries_count",
+    "ct_recent_count",
+    "passive_dns_hits",
+    "is_wildcard",
+    "is_cdn",
+    "cdn_provider",
+    "cloud_provider",
+    "cloud_artifacts",
+    "has_ipv6",
+    "ipv6_reachable",
+    "split_horizon_mismatch",
+    "dangling_cnames",
+    "decommission_likely",
+    "decommission_evidence",
     "waf_detected",
     "waf_provider",
+    "waf_blocking",
+    "waf_evidence",
     "asn_ip",
     "asn_number",
     "asn_org",
+    "asn_isp",
     "asn_country",
-    "decommission_likely",
+    "asn_city",
+    "asn_is_cloud",
+    "asn_cloud_provider",
     "reasoning",
 ]
 
@@ -248,6 +273,17 @@ def _flatten_report_row(scan: dict) -> dict[str, str]:
     subs = report.get("subdomains") or []
     resolved_subs = [s.get("fqdn", "") for s in subs if s.get("resolved")]
 
+    # Passive recon
+    passive = report.get("passive") or {}
+    ct_entries = passive.get("ct_entries") or []
+    ct_count = len(ct_entries)
+    ct_recent = sum(1 for e in ct_entries if e.get("is_recent"))
+    passive_dns_hits = passive.get("passive_dns_hits") or []
+    discovered_subs = passive.get("discovered_subdomains") or []
+
+    # Edge cases
+    edge = report.get("edge_cases") or {}
+
     reasoning = report.get("reasoning") or []
 
     return {
@@ -273,8 +309,10 @@ def _flatten_report_row(scan: dict) -> dict[str, str]:
         # WHOIS
         "whois_registered": _safe_get(whois, "registered"),
         "whois_registrar": _safe_get(whois, "registrar"),
+        "whois_creation_date": _safe_get(whois, "creation_date"),
         "whois_expiry_date": _safe_get(whois, "expiry_date"),
         "whois_nameservers": "; ".join(whois.get("nameservers") or []),
+        "whois_recently_expired": _safe_get(whois, "recently_expired"),
         # ICMP
         "icmp_reachable": _safe_get(icmp, "reachable"),
         "icmp_latency_ms": _safe_get(icmp, "latency_ms"),
@@ -286,10 +324,13 @@ def _flatten_report_row(scan: dict) -> dict[str, str]:
         "tls_handshake_ok": _safe_get(tls, "handshake_ok"),
         "tls_version": _safe_get(tls, "tls_version"),
         "tls_cert_cn": _safe_get(tls, "cert_cn"),
+        "tls_cert_san": "; ".join(tls.get("cert_san_list") or []),
         "tls_issuer": _safe_get(tls, "issuer"),
+        "tls_not_before": _safe_get(tls, "not_before"),
         "tls_not_after": _safe_get(tls, "not_after"),
         "tls_expired": _safe_get(tls, "is_expired"),
         "tls_matches_domain": _safe_get(tls, "cert_matches_domain"),
+        "tls_error_reason": _safe_get(tls, "error_reason"),
         # HTTP
         "http_status": _safe_get(http, "status_code"),
         "http_server": _safe_get(http, "server_header"),
@@ -297,18 +338,39 @@ def _flatten_report_row(scan: dict) -> dict[str, str]:
         # SMTP
         "smtp_responsive": _safe_get(smtp, "responsive"),
         "smtp_banner": _safe_get(smtp, "banner"),
-        # Subdomains
+        "smtp_starttls": _safe_get(smtp, "supports_starttls"),
+        # Subdomains / Passive
         "subdomains_found": "; ".join(resolved_subs),
+        "ct_entries_count": str(ct_count),
+        "ct_recent_count": str(ct_recent),
+        "passive_dns_hits": str(len(passive_dns_hits)),
+        # Edge cases
+        "is_wildcard": _safe_get(edge, "is_wildcard"),
+        "is_cdn": _safe_get(edge, "is_cdn"),
+        "cdn_provider": _safe_get(edge, "cdn_provider"),
+        "cloud_provider": _safe_get(edge, "cloud_provider"),
+        "cloud_artifacts": "; ".join(edge.get("cloud_artifacts") or []),
+        "has_ipv6": _safe_get(edge, "has_ipv6"),
+        "ipv6_reachable": _safe_get(edge, "ipv6_reachable"),
+        "split_horizon_mismatch": _safe_get(edge, "split_horizon_mismatch"),
+        "dangling_cnames": "; ".join(edge.get("dangling_cnames") or []),
+        # Decommission
+        "decommission_likely": _safe_get(decom, "likely_decommissioned"),
+        "decommission_evidence": "; ".join((decom.get("evidence") or [])),
         # WAF
         "waf_detected": _safe_get(waf, "detected"),
         "waf_provider": _safe_get(waf, "provider"),
+        "waf_blocking": _safe_get(waf, "is_blocking"),
+        "waf_evidence": "; ".join(waf.get("evidence") or []),
         # ASN
         "asn_ip": _safe_get(asn, "ip"),
         "asn_number": _safe_get(asn, "asn"),
         "asn_org": _safe_get(asn, "asn_org"),
+        "asn_isp": _safe_get(asn, "isp"),
         "asn_country": _safe_get(asn, "country"),
-        # Decommission
-        "decommission_likely": _safe_get(decom, "likely_decommissioned"),
+        "asn_city": _safe_get(asn, "city"),
+        "asn_is_cloud": _safe_get(asn, "is_cloud"),
+        "asn_cloud_provider": _safe_get(asn, "cloud_provider"),
         # Reasoning
         "reasoning": "; ".join(reasoning),
     }
